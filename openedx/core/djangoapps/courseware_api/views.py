@@ -201,6 +201,7 @@ class CoursewareMeta:
         """
         return {
             'first_section': CourseEnrollmentCelebration.should_celebrate_first_section(self.enrollment_object),
+            'should_celebrate_streak': CourseEnrollmentCelebration.should_celebrate_streak(self.enrollment_object),
         }
 
     @property
@@ -618,7 +619,9 @@ class Celebration(DeveloperErrorViewMixin, APIView):
             defaults['celebrate_first_section'] = first_section
 
         if defaults:
-            _, created = CourseEnrollmentCelebration.objects.update_or_create(enrollment=enrollment, defaults=defaults)
+            _, created = CourseEnrollmentCelebration.objects.update_or_create(
+                enrollment=enrollment, defaults=defaults
+            )
             return Response(status=201 if created else 200)
         else:
             return Response(status=200)  # just silently allow it

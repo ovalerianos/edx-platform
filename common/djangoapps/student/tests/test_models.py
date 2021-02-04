@@ -4,6 +4,7 @@ import hashlib
 
 import ddt
 import factory
+import mock
 import pytz
 from django.contrib.auth.models import AnonymousUser, User  # lint-amnesty, pylint: disable=imported-auth-user
 from django.core.cache import cache
@@ -11,22 +12,33 @@ from django.db.models import signals
 from django.db.models.functions import Lower
 from django.test import TestCase
 from opaque_keys.edx.keys import CourseKey
+from pytz import UTC
 
+from edx_toggles.toggles.testutils import override_waffle_flag
 from common.djangoapps.course_modes.models import CourseMode
 from common.djangoapps.course_modes.tests.factories import CourseModeFactory
 from lms.djangoapps.courseware.models import DynamicUpgradeDeadlineConfiguration
+from lms.djangoapps.courseware.toggles import (
+    COURSEWARE_MICROFRONTEND_PROGRESS_MILESTONES,
+    COURSEWARE_MICROFRONTEND_PROGRESS_MILESTONES_STREAK_CELEBRATION,
+    REDIRECT_TO_COURSEWARE_MICROFRONTEND
+)
 from openedx.core.djangoapps.content.course_overviews.models import CourseOverview
 from openedx.core.djangoapps.schedules.models import Schedule
 from openedx.core.djangoapps.schedules.tests.factories import ScheduleFactory
+from openedx.core.djangoapps.user_api.preferences.api import set_user_preference
 from openedx.core.djangolib.testing.utils import skip_unless_lms
 from common.djangoapps.student.models import (
     ALLOWEDTOENROLL_TO_ENROLLED,
     AccountRecovery,
     CourseEnrollment,
     CourseEnrollmentAllowed,
+    CourseEnrollmentCelebration,
     ManualEnrollmentAudit,
     PendingEmailChange,
-    PendingNameChange
+    PendingNameChange,
+    STREAK_LENGTH_TO_CELEBRATE,
+    STREAK_BREAK_LENGTH
 )
 from common.djangoapps.student.tests.factories import AccountRecoveryFactory, CourseEnrollmentFactory, UserFactory
 from xmodule.modulestore.tests.django_utils import SharedModuleStoreTestCase
@@ -242,6 +254,150 @@ class CourseEnrollmentTests(SharedModuleStoreTestCase):  # lint-amnesty, pylint:
         enrollment_refetched = CourseEnrollment.objects.filter(id=enrollment.id)
         self.assertTrue(enrollment_refetched.exists())
         self.assertEqual(enrollment_refetched.all()[0], enrollment)
+
+
+@override_waffle_flag(REDIRECT_TO_COURSEWARE_MICROFRONTEND, active=True)
+@override_waffle_flag(COURSEWARE_MICROFRONTEND_PROGRESS_MILESTONES, active=True)
+@override_waffle_flag(COURSEWARE_MICROFRONTEND_PROGRESS_MILESTONES_STREAK_CELEBRATION, active=True)
+class CourseEnrollmentCelebrationTests(SharedModuleStoreTestCase):
+    """
+    Tests for Course Enrollment Celebrations like the streak celebration
+    """
+    @classmethod
+    def setUpClass(cls):
+        super(CourseEnrollmentCelebrationTests, cls).setUpClass()
+        cls.course = CourseFactory()
+
+    def setUp(self):
+        super(CourseEnrollmentCelebrationTests, self).setUp()  # lint-amnesty, pylint: disable=super-with-arguments
+        self.user = UserFactory()
+        self.request = mock.Mock()
+        self.request.user = self.user
+
+    def test_first_time_celebration(self):
+        enrollment = CourseEnrollmentFactory(course_id=self.course.id)  # pylint: disable=no-member
+        should_celebrate = CourseEnrollmentCelebration.should_celebrate_streak(enrollment)
+        today = datetime.datetime.now(UTC).date()
+        self.assertEqual(enrollment.celebration.first_day_of_streak, today)
+        self.assertEqual(enrollment.celebration.last_day_of_streak, today)
+        self.assertEqual(enrollment.celebration.last_day_of_streak, today)
+        self.assertEqual(should_celebrate, False)
+
+    # lint-amnesty, pylint: disable=line-too-long
+    def test_celebrate_only_once_in_continuous_streak(self):
+        """
+        Sample run for a 3 day streak and 1 day break. See last column for explanation.
+        +---------+---------------------+--------------------+-------------------------+------------------+-----------------------------------------------+
+        | today   | first_day_of_streak | last_day_of_streak | last day of celebration | should_celebrate | Note                                          |
+        +---------+---------------------+--------------------+-------------------------+------------------+-----------------------------------------------+
+        | 2/4/21  | 2/4/21              | 2/4/21             | None                    | FALSE            | Day 1 of Streak                               |
+        | 2/5/21  | 2/4/21              | 2/5/21             | None                    | FALSE            | Day 2 of Streak                               |
+        | 2/6/21  | 2/4/21              | 2/6/21             | 2/6/21                  | TRUE             | Completed 3 Day Streak so we should celebrate |
+        | 2/7/21  | 2/4/21              | 2/7/21             | 2/6/21                  | FALSE            | Day 4 of Streak                               |
+        | 2/8/21  | 2/4/21              | 2/8/21             | 2/6/21                  | FALSE            | Day 5 of Streak                               |
+        | 2/9/21  | 2/4/21              | 2/9/21             | 2/6/21                  | FALSE            | Day 6 of Streak                               |
+        +---------+---------------------+--------------------+-------------------------+------------------+-----------------------------------------------+
+        """
+        enrollment = CourseEnrollmentFactory(course_id=self.course.id)  # pylint: disable=no-member
+        today = datetime.datetime.now(UTC)
+        for i in range(1, (STREAK_LENGTH_TO_CELEBRATE * 2) + 1):
+            with mock.patch.object(CourseEnrollmentCelebration, '_get_today') as get_today_mock:
+                get_today_mock.return_value = today + datetime.timedelta(days=i)
+                should_celebrate = CourseEnrollmentCelebration.should_celebrate_streak(enrollment)
+                self.assertEqual(should_celebrate, i == STREAK_LENGTH_TO_CELEBRATE)
+
+    # lint-amnesty, pylint: disable=line-too-long
+    def test_celebrate_only_once_with_multiple_calls_on_the_same_day(self):
+        """
+        Sample run for a 3 day streak and 1 day break. See last column for explanation.
+        +---------+---------------------+--------------------+-------------------------+------------------+-----------------------------------------------+
+        | today   | first_day_of_streak | last_day_of_streak | last day of celebration | should_celebrate | Note                                          |
+        +---------+---------------------+--------------------+-------------------------+------------------+-----------------------------------------------+
+        | 2/4/21  | 2/4/21              | 2/4/21             | None                    | FALSE            | Day 1 of Streak                               |
+        | 2/4/21  | 2/4/21              | 2/4/21             | None                    | FALSE            | Day 1 of Streak                               |
+        | 2/5/21  | 2/4/21              | 2/5/21             | None                    | FALSE            | Day 2 of Streak                               |
+        | 2/5/21  | 2/4/21              | 2/5/21             | None                    | FALSE            | Day 2 of Streak                               |
+        | 2/6/21  | 2/4/21              | 2/6/21             | 2/6/21                  | TRUE             | Completed 3 Day Streak so we should celebrate |
+        | 2/6/21  | 2/4/21              | 2/6/21             | 2/6/21                  | FALSE            | Already celebrated this streak.               |
+        +---------+---------------------+--------------------+-------------------------+------------------+-----------------------------------------------+
+        """
+        enrollment = CourseEnrollmentFactory(course_id=self.course.id)  # pylint: disable=no-member
+        today = datetime.datetime.now(UTC)
+        for i in range(1, STREAK_LENGTH_TO_CELEBRATE + 1):
+            with mock.patch.object(CourseEnrollmentCelebration, '_get_today') as get_today_mock:
+                get_today_mock.return_value = today + datetime.timedelta(days=i)
+                should_celebrate = CourseEnrollmentCelebration.should_celebrate_streak(enrollment)
+                self.assertEqual(should_celebrate, i == STREAK_LENGTH_TO_CELEBRATE)
+                should_celebrate = CourseEnrollmentCelebration.should_celebrate_streak(enrollment)
+                self.assertEqual(should_celebrate, False)
+
+    # lint-amnesty, pylint: disable=line-too-long
+    def test_celebration_with_utc(self):
+        """
+        Check that the _get_today method uses the user's timezone
+        """
+        set_user_preference(self.user, 'time_zone', 'Asia/Tokyo')
+        with mock.patch('crum.get_current_request', return_value=self.request):
+            today = CourseEnrollmentCelebration._get_today()  # lint-amnesty, pylint: disable=protected-access
+            self.assertEqual(str(today.tzinfo), 'Asia/Tokyo')
+
+    # lint-amnesty, pylint: disable=line-too-long
+    def test_celebrate_twice_with_break_in_between(self):
+        """
+        Sample run for a 3 day streak and 1 day break. See last column for explanation.
+        +---------+---------------------+--------------------+-------------------------+------------------+-----------------------------------------------+
+        | today   | first_day_of_streak | last_day_of_streak | last day of celebration | should_celebrate | Note                                          |
+        +---------+---------------------+--------------------+-------------------------+------------------+-----------------------------------------------+
+        | 2/4/21  | 2/4/21              | 2/4/21             | None                    | FALSE            | Day 1 of Streak                               |
+        | 2/5/21  | 2/4/21              | 2/5/21             | None                    | FALSE            | Day 2 of Streak                               |
+        | 2/6/21  | 2/4/21              | 2/6/21             | 2/6/21                  | TRUE             | Completed 3 Day Streak so we should celebrate |
+          No Accesses on 2/7/21
+        | 2/8/21  | 2/8/21              | 2/8/21             | 2/6/21                  | FALSE            | Day 1 of Streak                               |
+        | 2/9/21  | 2/8/21              | 2/9/21             | 2/6/21                  | FALSE            | Day 2 of Streak                               |
+        | 2/10/21 | 2/8/21              | 2/10/21            | 2/10/21                 | TRUE             | Completed 3 Day Streak so we should celebrate |
+        +---------+---------------------+--------------------+-------------------------+------------------+-----------------------------------------------+
+        """
+        enrollment = CourseEnrollmentFactory(course_id=self.course.id)  # pylint: disable=no-member
+        today = datetime.datetime.now(UTC)
+        for i in range(1, STREAK_LENGTH_TO_CELEBRATE + STREAK_BREAK_LENGTH + STREAK_LENGTH_TO_CELEBRATE + 1):
+            with mock.patch.object(CourseEnrollmentCelebration, '_get_today') as get_today_mock:
+                if STREAK_LENGTH_TO_CELEBRATE < i <= STREAK_LENGTH_TO_CELEBRATE + STREAK_BREAK_LENGTH:
+                    # Don't make any checks during the break
+                    continue
+                get_today_mock.return_value = today + datetime.timedelta(days=i)
+                should_celebrate = CourseEnrollmentCelebration.should_celebrate_streak(enrollment)
+                if i <= STREAK_LENGTH_TO_CELEBRATE:
+                    self.assertEqual(should_celebrate, i == STREAK_LENGTH_TO_CELEBRATE)
+                else:
+                    self.assertEqual(should_celebrate, i == STREAK_LENGTH_TO_CELEBRATE + STREAK_BREAK_LENGTH + STREAK_LENGTH_TO_CELEBRATE)
+
+    # lint-amnesty, pylint: disable=line-too-long
+    def test_streak_resets_if_day_is_missed(self):
+        """
+        Sample run for a 3 day streak with the learner coming back every other day.
+        Therefore the streak keeps resetting.
+        +---------+---------------------+--------------------+-------------------------+------------------+-----------------------------------------------+
+        | today   | first_day_of_streak | last_day_of_streak | last day of celebration | should_celebrate | Note                                          |
+        +---------+---------------------+--------------------+-------------------------+------------------+-----------------------------------------------+
+        | 2/4/21  | 2/4/21              | 2/4/21             | None                    | FALSE            | Day 1 of Streak                               |
+          No Accesses on 2/5/21
+        | 2/6/21  | 2/6/21              | 2/6/21             | None                    | FALSE            | Day 2 of streak was missed, so streak resets  |
+          No Accesses on 2/7/21
+        | 2/8/21  | 2/8/21              | 2/8/21             | None                    | FALSE            | Day 2 of streak was missed, so streak resets  |
+          No Accesses on 2/9/21
+        | 2/10/21 | 2/10/21             | 2/10/21            | None                    | FALSE            | Day 2 of streak was missed, so streak resets  |
+          No Accesses on 2/11/21
+        | 2/12/21 | 2/12/21             | 2/12/21            | None                    | FALSE            | Day 2 of streak was missed, so streak resets  |
+        +---------+---------------------+--------------------+-------------------------+------------------+-----------------------------------------------+
+        """
+        enrollment = CourseEnrollmentFactory(course_id=self.course.id)  # pylint: disable=no-member
+        today = datetime.datetime.now(UTC)
+        for i in range(0, STREAK_LENGTH_TO_CELEBRATE * 3, 2):
+            with mock.patch.object(CourseEnrollmentCelebration, '_get_today') as get_today_mock:
+                get_today_mock.return_value = today + datetime.timedelta(days=i)
+                should_celebrate = CourseEnrollmentCelebration.should_celebrate_streak(enrollment)
+                self.assertEqual(enrollment.celebration.first_day_of_streak, (today + datetime.timedelta(days=i)).date())
+                self.assertEqual(should_celebrate, False)
 
 
 class PendingNameChangeTests(SharedModuleStoreTestCase):

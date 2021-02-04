@@ -2,7 +2,7 @@
 Tests for courseware API
 """
 import unittest
-from datetime import datetime
+from datetime import datetime, timedelta
 from urllib.parse import urlencode
 
 import ddt
@@ -11,7 +11,9 @@ from completion.test_utils import CompletionWaffleTestMixin, submit_completions_
 from django.conf import settings
 from django.test.client import RequestFactory
 from django.urls import reverse  # lint-amnesty, pylint: disable=unused-import
+from pytz import UTC
 
+from edx_toggles.toggles.testutils import override_waffle_flag
 from lms.djangoapps.certificates.api import get_certificate_url
 from lms.djangoapps.certificates.tests.factories import (
     GeneratedCertificateFactory, LinkedInAddToProfileConfigurationFactory
@@ -19,8 +21,13 @@ from lms.djangoapps.certificates.tests.factories import (
 from lms.djangoapps.courseware.access_utils import ACCESS_DENIED, ACCESS_GRANTED
 from lms.djangoapps.courseware.tabs import ExternalLinkCourseTab
 from lms.djangoapps.courseware.tests.helpers import MasqueradeMixin
+from lms.djangoapps.courseware.toggles import (
+    COURSEWARE_MICROFRONTEND_PROGRESS_MILESTONES,
+    COURSEWARE_MICROFRONTEND_PROGRESS_MILESTONES_STREAK_CELEBRATION,
+    REDIRECT_TO_COURSEWARE_MICROFRONTEND
+)
 from lms.djangoapps.verify_student.services import IDVerificationService
-from common.djangoapps.student.models import CourseEnrollment, CourseEnrollmentCelebration
+from common.djangoapps.student.models import CourseEnrollment, CourseEnrollmentCelebration, STREAK_LENGTH_TO_CELEBRATE
 from common.djangoapps.student.tests.factories import CourseEnrollmentCelebrationFactory, UserFactory
 from xmodule.modulestore.django import modulestore
 from xmodule.modulestore.tests.django_utils import TEST_DATA_SPLIT_MODULESTORE, SharedModuleStoreTestCase
@@ -68,7 +75,10 @@ class BaseCoursewareTests(SharedModuleStoreTestCase):
 
 
 @ddt.ddt
-class CourseApiTestViews(BaseCoursewareTests):
+@override_waffle_flag(REDIRECT_TO_COURSEWARE_MICROFRONTEND, active=True)
+@override_waffle_flag(COURSEWARE_MICROFRONTEND_PROGRESS_MILESTONES, active=True)
+@override_waffle_flag(COURSEWARE_MICROFRONTEND_PROGRESS_MILESTONES_STREAK_CELEBRATION, active=True)
+class CourseApiTestViews(BaseCoursewareTests, MasqueradeMixin):
     """
     Tests for the courseware REST API
     """
@@ -169,6 +179,33 @@ class CourseApiTestViews(BaseCoursewareTests):
             else:
                 assert not response.data['can_load_courseware']['has_access']
 
+    def test_happy_path_for_streak(self):
+        CourseEnrollment.enroll(self.user, self.course.id, 'audit')
+
+        today = datetime.now(UTC)
+        for i in range(1, STREAK_LENGTH_TO_CELEBRATE + 1):
+            with mock.patch.object(CourseEnrollmentCelebration, '_get_today') as get_today_mock:
+                get_today_mock.return_value = today + timedelta(days=i)
+                response = self.client.get(self.url, content_type='application/json')
+                should_celebrate = response.json()['celebrations']['should_celebrate_streak']
+                self.assertEqual(should_celebrate, i == STREAK_LENGTH_TO_CELEBRATE)
+
+    def test_streak_masquerade(self):
+        self.user.is_staff = True
+        self.user.save()
+
+        user = UserFactory()
+        CourseEnrollment.enroll(user, self.course.id, 'verified')
+
+        self.update_masquerade(username=user.username)
+        today = datetime.now(UTC)
+        for i in range(1, STREAK_LENGTH_TO_CELEBRATE):
+            with mock.patch.object(CourseEnrollmentCelebration, '_get_today') as get_today_mock:
+                get_today_mock.return_value = today + timedelta(days=i)
+                response = self.client.get(self.url, content_type='application/json')
+                should_celebrate = response.json()['celebrations']['should_celebrate_streak']
+                self.assertEqual(should_celebrate, False)
+
 
 class SequenceApiTestViews(BaseCoursewareTests):
     """
@@ -218,6 +255,8 @@ class ResumeApiTestViews(BaseCoursewareTests, CompletionWaffleTestMixin):
 
 
 @ddt.ddt
+@override_waffle_flag(REDIRECT_TO_COURSEWARE_MICROFRONTEND, active=True)
+@override_waffle_flag(COURSEWARE_MICROFRONTEND_PROGRESS_MILESTONES, active=True)
 class CelebrationApiTestViews(BaseCoursewareTests, MasqueradeMixin):
     """
     Tests for the celebration API
