@@ -1,4 +1,5 @@
-#!/usr/bin/env python  # lint-amnesty, pylint: disable=django-not-configured
+# lint-amnesty, pylint: disable=django-not-configured
+# !/usr/bin/env python
 """
 Usage: manage.py {lms|cms} [--settings env] ...
 

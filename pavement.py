@@ -1,4 +1,5 @@
-import sys  # lint-amnesty, pylint: disable=django-not-configured, missing-module-docstring
+# lint-amnesty, pylint: disable=django-not-configured, missing-module-docstring
+import sys
 import os
 
 # Ensure that we can import pavelib, and that our copy of pavelib
